@@ -180,7 +180,9 @@ def claim_continuation_run(
                             ContinuationRun.id == existing_by_request.id,
                             ContinuationRun.status == existing_by_request.status,
                             ContinuationRun.delivered_count == 0,
-                            (ContinuationRun.continuation_ids == []) if legacy_empty_completed else sa.true(),
+                            # PostgreSQL JSON has no equality operator. Terminal
+                            # results are immutable; status/count/owner guard takeover.
+                            ContinuationRun.claim_token == existing_by_request.claim_token,
                         )
                         .values(
                             status=CONTINUATION_RUN_STATUS_RUNNING,

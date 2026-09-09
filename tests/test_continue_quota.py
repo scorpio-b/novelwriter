@@ -216,8 +216,19 @@ def test_empty_result_completion_is_rejected_at_persistence_boundary(db, hosted_
     assert run.error_code == "continuation_empty_result"
 
 
-def test_legacy_reclaim_has_one_owner_and_old_owner_cannot_complete(db, hosted_user, novel):
+def test_legacy_reclaim_has_one_owner_and_old_owner_cannot_complete(db, hosted_user, novel, monkeypatch):
     from app.core.continuation_runs import claim_continuation_run, complete_continuation_run
+    from sqlalchemy.dialects import postgresql
+
+    updates = []
+    execute = db.execute
+
+    def capture_update(statement, *args, **kwargs):
+        if getattr(statement, "is_update", False):
+            updates.append(statement)
+        return execute(statement, *args, **kwargs)
+
+    monkeypatch.setattr(db, "execute", capture_update)
 
     run = ContinuationRun(
         user_id=hosted_user.id, novel_id=novel.id, client_request_id="legacy-owner",
@@ -229,6 +240,9 @@ def test_legacy_reclaim_has_one_owner_and_old_owner_cannot_complete(db, hosted_u
     kwargs = dict(db=db, user_id=hosted_user.id, novel_id=novel.id,
                   client_request_id="legacy-owner", request_hash="same", semantic_key="active")
     assert claim_continuation_run(**kwargs, claim_token="new").owner
+    condition = str(updates[0].whereclause.compile(dialect=postgresql.dialect()))
+    assert "continuation_ids" not in condition
+    assert "claim_token" in condition
     assert not claim_continuation_run(**kwargs, claim_token="second").owner
     assert not complete_continuation_run(
         db, run_id=run.id, claim_token="old", continuation_ids=[], debug_summary={},
