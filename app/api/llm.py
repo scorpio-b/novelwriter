@@ -19,6 +19,7 @@ from app.core.ai_client import (
 )
 from app.core.auth import get_current_user_or_default
 from app.core.desktop_http_client import desktop_http_client_kwargs
+from app.core.json_completion import JsonCompletion
 from app.core.llm_config import (
     LLM_CONFIG_API_KEY_INVALID_CODE,
     LLM_CONFIG_API_KEY_INVALID_MESSAGE,
@@ -250,12 +251,16 @@ async def _probe_json_mode_support(
 ) -> None:
     # Reasoning consumes the completion budget even when content is still empty.
     # Retry only an explicit truncation, with a bounded larger budget.
+    completion = JsonCompletion({
+        "type": "object", "properties": {"ok": {"type": "boolean"}},
+        "required": ["ok"], "additionalProperties": False,
+    })
     for budget in _JSON_PROBE_TOKEN_BUDGETS:
-        response = await client.chat.completions.create(
+        response = await completion.create(
+            client,
             model=model,
             messages=[{"role": "user", "content": 'Return a JSON object: {"ok": true}'}],
             max_tokens=budget,
-            response_format={"type": "json_object"},
         )
         record_usage(response)
         if not response.choices:
