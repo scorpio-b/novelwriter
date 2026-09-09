@@ -149,8 +149,14 @@ def claim_continuation_run(
                     "continuation request id was reused with a different request payload"
                 )
 
+            # Older stream handling incorrectly completed requests with no results.
+            # Only reclaim an exact empty record; never regenerate delivered work.
+            legacy_empty_completed = (
+                existing_by_request.status == CONTINUATION_RUN_STATUS_COMPLETED
+                and existing_by_request.continuation_ids == []
+            )
             if (
-                existing_by_request.status == CONTINUATION_RUN_STATUS_FAILED
+                (existing_by_request.status == CONTINUATION_RUN_STATUS_FAILED or legacy_empty_completed)
                 and int(existing_by_request.delivered_count or 0) == 0
             ):
                 existing_active_semantic = _load_active_semantic_continuation_run(
@@ -172,8 +178,9 @@ def claim_continuation_run(
                         sa.update(ContinuationRun)
                         .where(
                             ContinuationRun.id == existing_by_request.id,
-                            ContinuationRun.status == CONTINUATION_RUN_STATUS_FAILED,
+                            ContinuationRun.status == existing_by_request.status,
                             ContinuationRun.delivered_count == 0,
+                            (ContinuationRun.continuation_ids == []) if legacy_empty_completed else sa.true(),
                         )
                         .values(
                             status=CONTINUATION_RUN_STATUS_RUNNING,
@@ -272,6 +279,13 @@ def complete_continuation_run(
     continuation_ids: list[int],
     debug_summary: dict[str, Any],
 ) -> bool:
+    if not continuation_ids:
+        fail_continuation_run(
+            db, run_id=run_id, claim_token=claim_token,
+            error_code="continuation_empty_result",
+            error_message="Continuation produced no saved results",
+        )
+        return False
     result = db.execute(
         sa.update(ContinuationRun)
         .where(

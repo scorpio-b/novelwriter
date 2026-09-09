@@ -173,6 +173,92 @@ def _continue_request_hash(payload: dict[str, object]) -> str:
     )
 
 
+def test_legacy_completed_empty_request_can_be_reclaimed(client, db, hosted_user, novel):
+    payload = {"num_versions": 1, "context_chapters": 1}
+    request_id = "legacy-empty-completed"
+    db.add(ContinuationRun(
+        user_id=hosted_user.id, novel_id=novel.id, client_request_id=request_id,
+        request_hash=_continue_request_hash(payload), claim_token="old-owner",
+        status="completed", delivered_count=0, continuation_ids=[],
+        debug_summary={"context_chapters": 1},
+    ))
+    db.commit()
+    response = client.post(
+        f"/api/novels/{novel.id}/continue", json=payload,
+        headers={"X-Novwr-Continuation-Request-ID": request_id},
+    )
+    assert response.status_code == 200
+    assert len(response.json()["continuations"]) == 1
+    db.expire_all()
+    run = db.query(ContinuationRun).one()
+    assert run.status == "completed"
+    assert run.delivered_count == 1
+    assert run.claim_token != "old-owner"
+    assert db.query(Continuation).count() == 1
+    assert hosted_user.generation_quota == 1
+
+
+def test_empty_result_completion_is_rejected_at_persistence_boundary(db, hosted_user, novel):
+    from app.core.continuation_runs import complete_continuation_run
+
+    run = ContinuationRun(
+        user_id=hosted_user.id, novel_id=novel.id, client_request_id="empty-boundary",
+        request_hash="same", claim_token="owner", status="running", delivered_count=0,
+        continuation_ids=[],
+    )
+    db.add(run)
+    db.commit()
+    assert not complete_continuation_run(
+        db, run_id=run.id, claim_token="owner", continuation_ids=[], debug_summary={},
+    )
+    db.refresh(run)
+    assert run.status == "failed"
+    assert run.error_code == "continuation_empty_result"
+
+
+def test_legacy_reclaim_has_one_owner_and_old_owner_cannot_complete(db, hosted_user, novel):
+    from app.core.continuation_runs import claim_continuation_run, complete_continuation_run
+
+    run = ContinuationRun(
+        user_id=hosted_user.id, novel_id=novel.id, client_request_id="legacy-owner",
+        request_hash="same", claim_token="old", status="completed", delivered_count=0,
+        continuation_ids=[],
+    )
+    db.add(run)
+    db.commit()
+    kwargs = dict(db=db, user_id=hosted_user.id, novel_id=novel.id,
+                  client_request_id="legacy-owner", request_hash="same", semantic_key="active")
+    assert claim_continuation_run(**kwargs, claim_token="new").owner
+    assert not claim_continuation_run(**kwargs, claim_token="second").owner
+    assert not complete_continuation_run(
+        db, run_id=run.id, claim_token="old", continuation_ids=[], debug_summary={},
+    )
+    db.refresh(run)
+    assert run.status == "running"
+    assert run.claim_token == "new"
+
+
+@pytest.mark.parametrize("delivered_count,ids", [(1, []), (0, [101]), (1, [101])])
+def test_legacy_recovery_never_reclaims_records_with_delivery_evidence(
+    db, hosted_user, novel, delivered_count, ids,
+):
+    from app.core.continuation_runs import claim_continuation_run
+
+    db.add(ContinuationRun(
+        user_id=hosted_user.id, novel_id=novel.id, client_request_id="has-result",
+        request_hash="same", claim_token="old", status="completed",
+        delivered_count=delivered_count, continuation_ids=ids,
+    ))
+    db.commit()
+    claim = claim_continuation_run(
+        db, user_id=hosted_user.id, novel_id=novel.id, client_request_id="has-result",
+        request_hash="same", semantic_key="active", claim_token="new",
+    )
+    assert not claim.owner
+    assert claim.status == "completed"
+    assert claim.continuation_ids == tuple(ids)
+
+
 def test_continue_charges_quota_on_success(client, db, hosted_user, novel):
     before = hosted_user.generation_quota
 

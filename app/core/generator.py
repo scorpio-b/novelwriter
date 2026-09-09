@@ -118,6 +118,8 @@ def _persist_continuation(
     prompt_used: str,
 ) -> Continuation:
     """Persist one continuation variant; rolls back and re-raises on failure."""
+    if not content.strip():
+        raise ValueError("Cannot persist an empty continuation")
     continuation = Continuation(
         novel_id=novel_id,
         chapter_number=chapter_number,
