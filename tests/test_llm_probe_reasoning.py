@@ -49,6 +49,8 @@ def probe(monkeypatch):
                                   headers={"content-type": "text/event-stream"})
         if "response_format" in body:
             result = responses.pop(0)
+            if isinstance(result, dict):
+                return httpx.Response(400, json={"error": result})
             if isinstance(result, int):
                 return httpx.Response(result, json={"error": {"message": "response_format json_object is not supported" if result == 400 else "Temporary outage with secret-token", "type": "invalid_request_error"}})
             content, reason, tokens = result
@@ -123,6 +125,17 @@ def test_explicit_json_mode_rejection_is_not_retried(probe):
     payload, requests, _ = probe([400])
     assert payload["code"] == "llm_probe_capability_mismatch"
     assert len(requests) == 3
+
+
+def test_lm_studio_schema_only_probe_matches_business_requests(probe):
+    payload, requests, _ = probe([
+        {"message": "'response_format.type' must be 'json_schema' or 'text'"},
+        ('{"ok":true}', "stop", 12),
+    ])
+    assert payload["code"] == "llm_probe_compatible"
+    assert payload["capability_statuses"]["json_mode"] == "supported"
+    assert requests[-1]["response_format"]["type"] == "json_schema"
+    assert requests[-1]["response_format"]["json_schema"]["schema"]["type"] == "object"
 
 
 def test_provider_outage_is_inconclusive_without_sdk_retries_or_error_leaks(probe):

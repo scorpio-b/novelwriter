@@ -164,6 +164,83 @@ def client(db, monkeypatch):
 
 
 class TestContinueEndpoint:
+    @pytest.mark.parametrize("failure", ["exception", "empty", "whitespace"])
+    def test_stream_without_a_result_is_failed_and_same_request_can_retry(
+        self, client, db, novel, monkeypatch, failure,
+    ):
+        from app.core import generator
+        from app.models import ContinuationRun
+
+        c, _ = client
+        original_stream = generator.ai_client.generate_stream
+
+        async def failed_stream(**kwargs):
+            if failure == "exception":
+                raise RuntimeError("context window exceeded")
+            yield "   " if failure == "whitespace" else ""
+
+        monkeypatch.setattr(generator.ai_client, "generate_stream", failed_stream)
+        headers = {"X-Novwr-Continuation-Request-ID": "retry-empty-stream"}
+        payload = {"num_versions": 1, "context_chapters": 2}
+        response = c.post(f"/api/novels/{novel.id}/continue/stream", json=payload, headers=headers)
+        assert response.status_code == 200
+        events = [json.loads(line) for line in response.text.splitlines()]
+        assert any(e["type"] == "error" for e in events)
+        assert not any(e["type"] == "variant_done" for e in events)
+        run = db.query(ContinuationRun).one()
+        assert run.status == "failed"
+        assert run.delivered_count == 0
+        assert db.query(Continuation).count() == 0
+
+        monkeypatch.setattr(generator.ai_client, "generate_stream", original_stream)
+        response = c.post(f"/api/novels/{novel.id}/continue/stream", json=payload, headers=headers)
+        assert response.status_code == 200
+        db.expire_all()
+        assert db.query(ContinuationRun).one().status == "completed"
+        assert db.query(Continuation).count() == 1
+
+    def test_stream_partial_success_keeps_valid_variant_and_replays_without_regeneration(
+        self, client, db, novel, monkeypatch,
+    ):
+        from app.core import generator
+        from app.models import ContinuationRun
+
+        c, _ = client
+
+        async def failed_stream(**kwargs):
+            raise RuntimeError("stream disconnected")
+            yield  # pragma: no cover
+
+        monkeypatch.setattr(generator.ai_client, "generate_stream", failed_stream)
+        payload = {"num_versions": 2, "context_chapters": 2}
+        headers = {"X-Novwr-Continuation-Request-ID": "partial-result"}
+        response = c.post(f"/api/novels/{novel.id}/continue/stream", json=payload, headers=headers)
+        assert response.status_code == 200
+        events = [json.loads(line) for line in response.text.splitlines()]
+        assert any(e["type"] == "error" and e.get("variant") == 0 for e in events)
+        assert any(e["type"] == "variant_done" and e["variant"] == 1 for e in events)
+        run = db.query(ContinuationRun).one()
+        assert run.status == "completed"
+        assert run.delivered_count == 1
+        assert len(run.continuation_ids) == 1
+        response = c.post(f"/api/novels/{novel.id}/continue", json=payload, headers=headers)
+        assert response.status_code == 200
+        assert db.query(Continuation).count() == 1
+
+    def test_stream_database_failure_does_not_claim_completion(self, client, db, novel, monkeypatch):
+        from app.core import generator
+        from app.models import ContinuationRun
+
+        def fail_persistence(*args, **kwargs):
+            raise RuntimeError("database unavailable")
+
+        monkeypatch.setattr(generator, "_persist_continuation", fail_persistence)
+        c, _ = client
+        response = c.post(f"/api/novels/{novel.id}/continue/stream", json={"num_versions": 1})
+        assert response.status_code == 200
+        assert db.query(ContinuationRun).one().status == "failed"
+        assert db.query(Continuation).count() == 0
+
     def test_injects_world_context_and_returns_debug(self, client, db, novel, world):
         c, captured = client
 

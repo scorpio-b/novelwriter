@@ -8,6 +8,7 @@ from pydantic import BaseModel
 from app.config import get_settings
 from app.core.desktop_http_client import desktop_http_client_kwargs
 from app.core.llm_config import ResolvedLlmConfig
+from app.core.json_completion import JsonCompletion
 from app.core.safety_fuses import (
     ensure_ai_available_fresh_session,
     token_usage_recording_disabled,
@@ -468,7 +469,9 @@ class AIClient:
         usage_billing_source = llm_config.billing_source_hint
         ensure_ai_available_fresh_session(billing_source=usage_billing_source)
 
-        schema_json = json.dumps(response_model.model_json_schema(), ensure_ascii=False)
+        schema = response_model.model_json_schema()
+        completion = JsonCompletion(schema)
+        schema_json = json.dumps(schema, ensure_ascii=False)
         structured_system = (
             f"{system_prompt}\n\n"
             f"You MUST respond with valid JSON matching this schema:\n{schema_json}"
@@ -479,7 +482,8 @@ class AIClient:
         async with _openai_client(llm_config) as client:
             for attempt in range(max_retries):
                 try:
-                    response = await client.chat.completions.create(
+                    response = await completion.create(
+                        client,
                         model=llm_config.model,
                         messages=[
                             {"role": "system", "content": structured_system},
@@ -487,7 +491,6 @@ class AIClient:
                         ],
                         max_tokens=max_tokens,
                         temperature=temperature,
-                        response_format={"type": "json_object"},
                     )
                 except Exception:
                     _log_provider_failure(

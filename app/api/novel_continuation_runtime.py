@@ -637,6 +637,7 @@ async def handle_continue_stream_request(
 
             contents_by_variant: dict[int, str] = {}
             total_variants: int | None = None
+            last_variant_error: tuple[str, str] | None = None
 
             async for event in continue_novel_stream(
                 db=db,
@@ -655,6 +656,11 @@ async def handle_continue_stream_request(
                 temperature=req.temperature,
                 user_id=current_user.id,
             ):
+                if event.get("type") == "error":
+                    last_variant_error = (
+                        str(event.get("code") or "continuation_stream_failed"),
+                        str(event.get("message") or "Continuation stream failed"),
+                    )
                 if event.get("type") == "start":
                     try:
                         total_variants = int(event.get("total_variants") or req.num_versions)
@@ -677,6 +683,20 @@ async def handle_continue_stream_request(
                         pass
 
                 if event.get("type") == "done":
+                    if not event.get("continuation_ids"):
+                        error_code, error_message = last_variant_error or (
+                            "continuation_empty_result", "Continuation produced no saved results",
+                        )
+                        _fail_claimed_run(
+                            db, run_resolution, error_code=error_code, error_message=error_message,
+                        )
+                        if last_variant_error is None:
+                            yield json.dumps({
+                                "type": "error", "code": error_code, "message": error_message,
+                            }, ensure_ascii=False) + "\n"
+                        # 'done' terminates the transport, not a promise of success.
+                        yield json.dumps(event, ensure_ascii=False) + "\n"
+                        continue
                     variant_count = int(total_variants or req.num_versions)
                     continuations = [
                         SimpleNamespace(content=contents_by_variant.get(i, ""))
