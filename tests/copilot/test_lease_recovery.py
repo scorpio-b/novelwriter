@@ -260,12 +260,11 @@ class TestLeaseRecovery:
     @pytest.mark.asyncio
     async def test_resumed_loop_budget_exhaustion_still_forces_wrapup(self, db, novel, entities, chapters, monkeypatch):
         """If inherited workspace already used all rounds, the loop immediately
-        forces a wrap-up call (tool_choice=none)."""
+        forces a structured wrap-up without new tool calls."""
         from app.core.copilot.runtime_adapters import run_tool_loop as _run_tool_loop
         from app.core.copilot.scope import gather_evidence, load_scope_snapshot
         from app.core.copilot.runtime_scenario import derive_scenario
         from app.core.copilot.workspace import Workspace
-        from app.core.ai_client import ToolLLMResponse
 
         snapshot = load_scope_snapshot(db, novel, "research", "whole_book", None)
         evidence = gather_evidence(db, novel, snapshot, None)
@@ -280,16 +279,15 @@ class TestLeaseRecovery:
             {"role": "user", "content": "q"},
         ]
 
-        tool_choice_seen = []
+        structured_calls = []
 
         async def mock_generate(self_client, **kwargs):
-            tool_choice_seen.append(kwargs.get("tool_choice"))
-            return ToolLLMResponse(
-                content='{"answer": "budget done", "suggestions": []}',
-                tool_calls=[], finish_reason="stop",
-            )
+            structured_calls.append(kwargs)
+            assert kwargs["messages"] == prev_ws.messages
+            assert "tools" not in kwargs
+            return kwargs["response_model"](answer="budget done")
 
-        monkeypatch.setattr("app.core.ai_client.AIClient.generate_with_tools", mock_generate)
+        monkeypatch.setattr("app.core.ai_client.AIClient.generate_structured", mock_generate)
         monkeypatch.setattr("app.core.llm_semaphore.acquire_llm_slot", lambda: _noop_coro())
         monkeypatch.setattr("app.core.llm_semaphore.release_llm_slot", lambda: None)
 
@@ -301,4 +299,4 @@ class TestLeaseRecovery:
 
         assert parsed["answer"] == "budget done"
         # The loop had 0 remaining rounds, so it went straight to wrap-up
-        assert "none" in tool_choice_seen
+        assert len(structured_calls) == 1

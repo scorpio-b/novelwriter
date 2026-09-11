@@ -11,13 +11,16 @@ wrappers for tests and callers that monkeypatch facade symbols.
 from __future__ import annotations
 
 import logging
+import json
 import uuid
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 
 from sqlalchemy.orm import Session, load_only
 
-from app.core.ai_client import ToolCallUnsupportedError
+from app.core.ai_client import LLMUnavailableError, StructuredOutputParseError, ToolCallUnsupportedError
+from app.core.structured_output import validate_structured_output
+from .final_response import CopilotFinalResponse
 from app.core.llm_config import ResolvedLlmConfig
 from app.core.copilot.prompt_contract import PromptBuild
 from app.core.copilot.prompting import (
@@ -179,6 +182,8 @@ def _validate_final_result(parsed: Any) -> None:
     answer = parsed.get("answer") if isinstance(parsed, dict) else None
     if not isinstance(answer, str) or not answer.strip():
         raise EmptyCopilotResultError("Copilot returned no usable final answer")
+    # A nonempty raw JSON string is not proof of a valid structured result.
+    validate_structured_output(json.dumps(parsed, ensure_ascii=False), CopilotFinalResponse)
 
 
 async def _run_with_degradation(
@@ -221,6 +226,10 @@ async def _run_with_degradation(
         )
         _validate_final_result(parsed)
         return parsed, final_evidence, workspace, "tool_loop", None
+    except (StructuredOutputParseError, LLMUnavailableError):
+        # Formatting has its own bounded budget; do not restart research or
+        # retry authentication/network failures as if they were content errors.
+        raise
     except ToolCallUnsupportedError:
         logger.warning("Tool calls unsupported, degrading to one-shot", exc_info=True)
         execution_mode = "one_shot_unsupported"

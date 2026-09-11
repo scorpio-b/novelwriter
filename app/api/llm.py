@@ -2,7 +2,6 @@
 
 from collections.abc import Awaitable, Callable
 import asyncio
-import json
 import time
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
@@ -10,6 +9,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.routing import APIRoute
 from openai import AsyncOpenAI
+from pydantic import BaseModel, ConfigDict
 from sqlalchemy.orm import Session
 
 from app.config import Settings, get_settings
@@ -20,6 +20,7 @@ from app.core.ai_client import (
 from app.core.auth import get_current_user_or_default
 from app.core.desktop_http_client import desktop_http_client_kwargs
 from app.core.json_completion import JsonCompletion
+from app.core.structured_output import StructuredOutputParseError, validate_structured_output
 from app.core.llm_config import (
     LLM_CONFIG_API_KEY_INVALID_CODE,
     LLM_CONFIG_API_KEY_INVALID_MESSAGE,
@@ -246,15 +247,17 @@ async def _probe_stream_support(
         await stream.close()
 
 
+class _JsonProbeResult(BaseModel):
+    model_config = ConfigDict(strict=True, extra="forbid")
+    ok: bool
+
+
 async def _probe_json_mode_support(
     client: AsyncOpenAI, model: str, record_usage: Callable[[object], None],
 ) -> None:
     # Reasoning consumes the completion budget even when content is still empty.
     # Retry only an explicit truncation, with a bounded larger budget.
-    completion = JsonCompletion({
-        "type": "object", "properties": {"ok": {"type": "boolean"}},
-        "required": ["ok"], "additionalProperties": False,
-    })
+    completion = JsonCompletion(_JsonProbeResult.model_json_schema())
     for budget in _JSON_PROBE_TOKEN_BUDGETS:
         response = await completion.create(
             client,
@@ -269,11 +272,12 @@ async def _probe_json_mode_support(
         if choice.finish_reason == "length":
             continue
         try:
-            parsed = json.loads(choice.message.content or "")
-        except (ValueError, TypeError):
+            validate_structured_output(
+                choice.message.content or "", _JsonProbeResult,
+                finish_reason=choice.finish_reason,
+            )
+        except StructuredOutputParseError:
             raise _ProbeInconclusiveError("JSON probe returned unusable content") from None
-        if not isinstance(parsed, dict):
-            raise _ProbeInconclusiveError("JSON probe did not return an object")
         return
     raise _ProbeInconclusiveError("JSON probe exhausted its completion budget")
 

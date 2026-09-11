@@ -313,65 +313,21 @@ async def call_copilot_llm(
     llm_config: ResolvedLlmConfig,
     user_id: int,
 ) -> str:
+    from .final_response import finish_copilot_response
+
     client = AIClient()
-    return await client.generate(
-        prompt=user_prompt,
-        llm_config=llm_config,
-        system_prompt=system_prompt,
-        max_tokens=4000,
-        temperature=0.4,
-        role="default",
-        user_id=user_id,
+    result = await finish_copilot_response(
+        client=client, llm_config=llm_config, user_id=user_id,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
     )
+    return json.dumps(result, ensure_ascii=False)
 
 
 def parse_llm_response(text: str) -> dict[str, Any]:
-    """Parse the LLM's final response into structured output.
+    """Compatibility facade; all final-answer validation lives in one place."""
+    from .final_response import parse_final_response
 
-    Handles common LLM formatting quirks:
-    1. Pure JSON
-    2. JSON wrapped in ```json ... ``` code blocks (possibly with text before/after)
-    3. Raw JSON object embedded in natural language text
-    4. Fallback: treat entire text as the answer (no suggestions)
-
-    Tool-call markup that a gateway returned as plain text (instead of a
-    structured tool call) is stripped first so raw scaffolding never reaches the
-    user-facing answer. The happy path (clean prose or answer JSON) is untouched.
-    """
-    import re
-
-    from app.core.copilot.tool_call_recovery import (
-        contains_tool_call_markup,
-        strip_tool_call_markup,
-    )
-
-    if contains_tool_call_markup(text):
-        text = strip_tool_call_markup(text)
-
-    stripped = text.strip()
-
-    try:
-        return json.loads(stripped)
-    except json.JSONDecodeError:
-        pass
-
-    code_block_match = re.search(
-        r"```(?:json)?\s*\n(\{.*?\})\s*\n```", stripped, re.DOTALL
-    )
-    if code_block_match:
-        try:
-            return json.loads(code_block_match.group(1))
-        except json.JSONDecodeError:
-            pass
-
-    first_brace = stripped.find("{")
-    if first_brace != -1:
-        candidate = stripped[first_brace:]
-        for end in range(len(candidate), 1, -1):
-            snippet = candidate[:end]
-            try:
-                return json.loads(snippet)
-            except json.JSONDecodeError:
-                continue
-
-    return {"answer": text, "cited_evidence_indices": [], "suggestions": []}
+    return parse_final_response(text)

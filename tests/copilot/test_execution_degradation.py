@@ -36,13 +36,17 @@ class TestDegradation:
             calls.append(kwargs.get("tool_choice"))
             return ToolLLMResponse(content=content, tool_calls=[], finish_reason="stop")
 
-        async def one_shot_response(self, **kwargs):
-            calls.append("fallback")
-            return fallback
+        async def structured_response(self, **kwargs):
+            from app.core.ai_client import StructuredOutputParseError
+            from app.core.copilot.final_response import parse_final_response
+            calls.append("structured")
+            if not fallback:
+                raise StructuredOutputParseError(max_retries=kwargs["max_retries"])
+            return kwargs["response_model"].model_validate(parse_final_response(fallback))
 
         monkeypatch.setattr(get_settings(), "copilot_max_tool_rounds", rounds)
         monkeypatch.setattr("app.core.ai_client.AIClient.generate_with_tools", tool_response)
-        monkeypatch.setattr("app.core.ai_client.AIClient.generate", one_shot_response)
+        monkeypatch.setattr("app.core.ai_client.AIClient.generate_structured", structured_response)
         monkeypatch.setattr("app.core.llm_semaphore.acquire_llm_slot", _noop_coro)
         monkeypatch.setattr("app.core.llm_semaphore.release_llm_slot", lambda: None)
         monkeypatch.setattr("app.database.SessionLocal", lambda: db)
@@ -50,7 +54,7 @@ class TestDegradation:
 
         await execute_copilot_run(run.run_id, novel.id, 1, TEST_LLM_CONFIG)
         db.refresh(run)
-        assert calls == ["none" if rounds == 0 else None, "fallback"]
+        assert calls == (["structured"] if rounds == 0 else [None, "structured"])
         assert run.status == expected_status
         if expected_status == "completed":
             assert run.answer == fallback

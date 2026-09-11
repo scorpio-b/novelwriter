@@ -366,14 +366,6 @@ class TestAgentLoop:
         async def mock_generate_with_tools(self_client, **kwargs):
             nonlocal call_count
             call_count += 1
-            tool_choice = kwargs.get("tool_choice")
-            if tool_choice == "none":
-                # Forced wrap-up
-                return ToolLLMResponse(
-                    content='{"answer": "预算用尽", "suggestions": []}',
-                    tool_calls=[],
-                    finish_reason="stop",
-                )
             # Always request a tool call to exhaust budget
             return ToolLLMResponse(
                 content=None,
@@ -381,12 +373,19 @@ class TestAgentLoop:
                 finish_reason="tool_calls",
             )
 
+        async def structured_wrap_up(self_client, **kwargs):
+            assert "tools" not in kwargs
+            assert any(m["role"] == "tool" for m in kwargs["messages"])
+            return kwargs["response_model"](answer="预算用尽")
+
+        monkeypatch.setattr("app.core.ai_client.AIClient.generate_structured", structured_wrap_up)
         monkeypatch.setattr("app.core.ai_client.AIClient.generate_with_tools", mock_generate_with_tools)
         monkeypatch.setattr("app.core.llm_semaphore.acquire_llm_slot", lambda: _noop_coro())
         monkeypatch.setattr("app.core.llm_semaphore.release_llm_slot", lambda: None)
 
         # Override max rounds to 2 for faster test
-        monkeypatch.setattr("app.config.Settings.copilot_max_tool_rounds", 2, raising=False)
+        from app.config import get_settings
+        monkeypatch.setattr(get_settings(), "copilot_max_tool_rounds", 2)
 
         def test_db_factory():
             return db
@@ -395,6 +394,7 @@ class TestAgentLoop:
             test_db_factory, novel.id, session_data, prompt, TEST_LLM_CONFIG, 1, snapshot, scenario, evidence, "task_query",
         )
         assert parsed["answer"] == "预算用尽"
+        assert call_count == 2
 
     @pytest.mark.asyncio
     async def test_workspace_persisted_after_each_step(self, db, novel, entities, chapters, mock_setup, monkeypatch):
