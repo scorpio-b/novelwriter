@@ -107,6 +107,13 @@ def test_reasoning_truncation_retries_then_confirms_json_mode(probe):
     assert all(kwargs["billing_source"] == "hosted" for _, kwargs in usage)
 
 
+@pytest.mark.parametrize("content", ['{}', '{"ok":"yes"}', '{"ok":true,"ok":false}', '{"ok":true,"extra":1}'])
+def test_json_probe_uses_the_shared_schema_validator(probe, content):
+    payload, requests, usage = probe([(content, "stop", 12)])
+    assert payload["capability_statuses"]["json_mode"] == "unknown"
+    assert payload["capabilities"]["json_mode"] is False
+
+
 def test_persistent_truncation_is_inconclusive_and_bounded(probe):
     payload, requests, _ = probe([(None, "length", 256), ('{"ok":', "length", 1024)])
     assert payload["code"] == "llm_probe_inconclusive"

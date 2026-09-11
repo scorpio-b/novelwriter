@@ -7,12 +7,14 @@ from __future__ import annotations
 
 import json
 import logging
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 
 from sqlalchemy.orm import Session
 
 from app.core.ai_client import AIClient
+from .final_response import finish_copilot_response
 from app.core.llm_config import ResolvedLlmConfig
 from app.core.copilot.prompt_contract import PromptBuild
 from app.core.copilot.run_state import ensure_run_lease as _ensure_run_lease
@@ -53,12 +55,23 @@ class ToolLoopDeps:
     tool_load_scope_snapshot: Callable[[ScopeSnapshot], str]
     persist_workspace: Callable[..., bool]
     renew_run_lease: Callable[..., bool]
-    parse_llm_response: Callable[[str], dict[str, Any]]
     evidence_from_workspace: Callable[
         [Workspace, list[EvidenceItem], str], list[EvidenceItem]
     ]
     lease_lost_error_factory: Callable[[str], Exception]
     client_factory: Callable[[], AIClient] = AIClient
+
+
+@asynccontextmanager
+async def _final_request_slot(deps, db_factory, run_id, worker_id):
+    await deps.acquire_llm_slot()
+    try:
+        await run_sync(
+            _ensure_run_lease, deps, db_factory, run_id=run_id, worker_id=worker_id
+        )
+        yield
+    finally:
+        deps.release_llm_slot()
 
 
 def _execute_pending_tool_calls(
@@ -348,10 +361,23 @@ async def run_tool_loop(
                 recovered_from_text = True
 
         if not tool_calls:
-            parsed = deps.parse_llm_response(response.content or "")
+            # Persist the gathered evidence before the optional formatting repair.
             workspace.final_answer_draft = response.content
-            if response.content:
-                messages.append({"role": "assistant", "content": response.content})
+            workspace.messages = list(messages)
+            await run_sync(
+                _persist_workspace, deps, db_factory, run_id, workspace, worker_id=worker_id
+            )
+            parsed = await finish_copilot_response(
+                client=client, messages=messages, response=response,
+                llm_config=llm_config, user_id=user_id,
+                allow_plain_text=not deps.should_preload_world_context(turn_intent),
+                request_context=_final_request_slot(deps, db_factory, run_id, worker_id),
+            )
+            await run_sync(
+                _ensure_run_lease, deps, db_factory, run_id=run_id, worker_id=worker_id
+            )
+            workspace.final_answer_draft = json.dumps(parsed, ensure_ascii=False)
+            messages.append({"role": "assistant", "content": workspace.final_answer_draft})
             workspace.messages = list(messages)
             return (
                 parsed,
@@ -397,29 +423,17 @@ async def run_tool_loop(
     await run_sync(
         _ensure_run_lease, deps, db_factory, run_id=run_id, worker_id=worker_id
     )
-    await deps.acquire_llm_slot()
-    try:
-        response = await client.generate_with_tools(
-            messages=messages,
-            tools=deps.tool_catalog.tool_schemas,
-            llm_config=llm_config,
-            max_tokens=4000,
-            temperature=0.4,
-            role="default",
-            user_id=user_id,
-            tool_choice="none",
-        )
-    finally:
-        deps.release_llm_slot()
+    parsed = await finish_copilot_response(
+        client=client, messages=messages, llm_config=llm_config, user_id=user_id,
+        request_context=_final_request_slot(deps, db_factory, run_id, worker_id),
+    )
 
     await run_sync(
         _ensure_run_lease, deps, db_factory, run_id=run_id, worker_id=worker_id
     )
 
-    parsed = deps.parse_llm_response(response.content or "")
-    workspace.final_answer_draft = response.content
-    if response.content:
-        messages.append({"role": "assistant", "content": response.content})
+    workspace.final_answer_draft = json.dumps(parsed, ensure_ascii=False)
+    messages.append({"role": "assistant", "content": workspace.final_answer_draft})
     workspace.messages = list(messages)
     return (
         parsed,

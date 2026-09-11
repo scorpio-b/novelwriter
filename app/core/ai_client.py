@@ -9,6 +9,10 @@ from app.config import get_settings
 from app.core.desktop_http_client import desktop_http_client_kwargs
 from app.core.llm_config import ResolvedLlmConfig
 from app.core.json_completion import JsonCompletion
+from app.core.structured_output import (
+    StructuredOutputParseError as StructuredOutputParseError,
+    generate_validated_output,
+)
 from app.core.safety_fuses import (
     ensure_ai_available_fresh_session,
     token_usage_recording_disabled,
@@ -23,19 +27,6 @@ AgentRole = Literal["director", "writer", "editor", "summary", "default"]
 
 class LLMUnavailableError(RuntimeError):
     """Raised when an LLM request cannot be completed (network/auth/provider errors)."""
-
-
-class StructuredOutputParseError(ValueError):
-    """Raised when an LLM returns output that cannot be parsed into the response model."""
-
-    def __init__(self, *, max_retries: int, last_error: Exception | None = None):
-        # Keep prefix stable for callers that key off the message.
-        message = f"Failed to parse structured output after {max_retries} retries"
-        if last_error is not None:
-            message = f"{message}: {type(last_error).__name__}"
-        super().__init__(message)
-        self.max_retries = max_retries
-        self.last_error = last_error
 
 
 class ToolCallUnsupportedError(RuntimeError):
@@ -458,13 +449,15 @@ class AIClient:
         role: AgentRole = "default",
         max_retries: int = 3,
         user_id: int | None = None,
+        messages: list[dict[str, Any]] | None = None,
+        retry_transport_errors: bool = True,
     ) -> T:
         """
-        Generate structured output via OpenAI-compatible JSON mode + Pydantic parsing.
+        Generate validated JSON; optionally preserve an existing tool conversation.
 
         Raises:
             StructuredOutputParseError: If structured output cannot be parsed after retries
-            LLMUnavailableError: If the LLM request fails after retries
+            LLMUnavailableError: If transport fails without a usable response
         """
         usage_billing_source = llm_config.billing_source_hint
         ensure_ai_available_fresh_session(billing_source=usage_billing_source)
@@ -477,83 +470,57 @@ class AIClient:
             f"You MUST respond with valid JSON matching this schema:\n{schema_json}"
         )
 
-        saw_response = False
+        if messages is not None:
+            request_messages = [dict(message) for message in messages]
+            if request_messages and request_messages[0].get("role") == "system":
+                request_messages[0]["content"] = (
+                    f"{request_messages[0]['content']}\n\n{structured_system}"
+                )
+            else:
+                request_messages.insert(0, {"role": "system", "content": structured_system})
+        else:
+            request_messages = [
+                {"role": "system", "content": structured_system},
+                {"role": "user", "content": prompt},
+            ]
 
         async with _openai_client(llm_config) as client:
-            for attempt in range(max_retries):
+            request_attempt = 0
+
+            async def request(current_messages):
+                nonlocal request_attempt
+                request_attempt += 1
                 try:
                     response = await completion.create(
                         client,
                         model=llm_config.model,
-                        messages=[
-                            {"role": "system", "content": structured_system},
-                            {"role": "user", "content": prompt},
-                        ],
+                        messages=current_messages,
                         max_tokens=max_tokens,
                         temperature=temperature,
                     )
                 except Exception:
                     _log_provider_failure(
                         operation="generate_structured",
-                        attempt=attempt + 1,
+                        attempt=request_attempt,
                         max_attempts=max_retries,
                     )
-                    continue
+                else:
+                    if response.usage:
+                        _record_usage(
+                            llm_config.model,
+                            response.usage.prompt_tokens,
+                            response.usage.completion_tokens,
+                            node_name=role,
+                            user_id=user_id,
+                            billing_source=usage_billing_source,
+                        )
+                    return response
+                raise LLMUnavailableError(_PROVIDER_REQUEST_FAILED_MESSAGE) from None
 
-                saw_response = True
-                if response.usage:
-                    _record_usage(
-                        llm_config.model,
-                        response.usage.prompt_tokens,
-                        response.usage.completion_tokens,
-                        node_name=role,
-                        user_id=user_id,
-                        billing_source=usage_billing_source,
-                    )
-                raw = response.choices[0].message.content or ""
-                finish_reason = response.choices[0].finish_reason
-                response_id = getattr(response, "id", None)
-
-                # If truncated (length limit hit), retrying won't help.
-                if finish_reason == "length":
-                    logger.warning(
-                        "generate_structured truncated (max_tokens=%s, finish_reason=%s, content_len=%s, response_id=%s)",
-                        max_tokens,
-                        finish_reason,
-                        len(raw),
-                        response_id,
-                        extra={"base_url": llm_config.base_url, "model": llm_config.model},
-                    )
-                    raise StructuredOutputParseError(
-                        max_retries=1,
-                        last_error=ValueError(
-                            f"LLM response truncated (finish_reason=length, max_tokens={max_tokens}). "
-                            "Increase max_tokens or reduce input."
-                        ),
-                    )
-
-                try:
-                    return response_model.model_validate_json(raw)
-                except Exception as exc:
-                    logger.warning(
-                        "generate_structured parse failed (attempt %s/%s, finish_reason=%s, content_len=%s, response_id=%s)",
-                        attempt + 1,
-                        max_retries,
-                        finish_reason,
-                        len(raw),
-                        response_id,
-                        extra={
-                            "base_url": llm_config.base_url,
-                            "model": llm_config.model,
-                            "parse_error_type": type(exc).__name__,
-                        },
-                    )
-                    continue
-
-            if saw_response:
-                raise StructuredOutputParseError(max_retries=max_retries) from None
-
-            raise LLMUnavailableError(_PROVIDER_REQUEST_FAILED_MESSAGE) from None
+            return await generate_validated_output(
+                request, request_messages, response_model, max_attempts=max_retries,
+                retry_request_errors=(LLMUnavailableError,) if retry_transport_errors else (),
+            )
 
 
 ai_client = AIClient()

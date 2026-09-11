@@ -54,7 +54,6 @@ async def run_tool_loop(
         tool_load_scope_snapshot=_tool_load_scope_snapshot,
         persist_workspace=run_store_mod.persist_running_workspace,
         renew_run_lease=run_store_mod.renew_run_lease,
-        parse_llm_response=run_state_mod.parse_llm_response,
         evidence_from_workspace=workspace_mod.evidence_from_workspace,
         lease_lost_error_factory=RunLeaseLostError,
     )

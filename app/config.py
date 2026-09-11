@@ -162,6 +162,8 @@ class Settings(BaseSettings):
     copilot_max_runs_per_user: int = 2
     copilot_max_runs_global: int = 10
     copilot_max_tool_rounds: int = 8
+    # Includes a spontaneous tool-loop answer, when present; no nested repair loop.
+    copilot_final_max_attempts: int = Field(default=2, ge=1, le=5)
     copilot_run_queue_timeout_seconds: int = 30
     copilot_run_lease_seconds: int = 300
     copilot_run_stale_timeout_seconds: int = 300

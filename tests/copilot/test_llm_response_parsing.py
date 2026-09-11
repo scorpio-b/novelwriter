@@ -40,10 +40,30 @@ class TestParseLLMResponse:
         assert "natural language" in result["answer"]
         assert result["suggestions"] == []
 
-    def test_malformed_json_fallback(self):
+    def test_malformed_json_is_not_a_successful_text_answer(self):
+        import pytest
+        from app.core.ai_client import StructuredOutputParseError
         from app.core.copilot.run_state import parse_llm_response as _parse_llm_response
-        result = _parse_llm_response('{"answer": "incomplete json')
-        assert "incomplete json" in result["answer"]
+        with pytest.raises(StructuredOutputParseError):
+            _parse_llm_response('{"answer": "incomplete json')
+
+    def test_unescaped_quotes_in_chinese_answer_are_not_silently_accepted(self):
+        import pytest
+        from app.core.ai_client import StructuredOutputParseError
+        from app.core.copilot.run_state import parse_llm_response
+        with pytest.raises(StructuredOutputParseError):
+            parse_llm_response('{"answer":"李华有"小男人"性格","suggestions":[]}')
+
+    def test_wrong_field_types_cannot_become_completed_answers(self):
+        import pytest
+        from app.core.ai_client import StructuredOutputParseError
+        from app.core.copilot.run_state import parse_llm_response
+        for text in ('{"answer":123}', '{"answer":"ok","suggestions":"bad"}',
+                     '{"answer":"ok","suggestions":[null]}',
+                     '{"answer":"ok","cited_evidence_indices":[true]}',
+                     '{"answer":"ok","suggestions":[{"delta":[]}]}'):
+            with pytest.raises(StructuredOutputParseError):
+                parse_llm_response(text)
 
     def test_mixed_markdown_with_json_block(self):
         """Real LLM pattern: markdown analysis followed by JSON block."""
